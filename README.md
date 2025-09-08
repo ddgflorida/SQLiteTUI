@@ -2,7 +2,7 @@
 
 **SQLiteTUI** is a fast, modern, and intuitive TUI (Text-based User Interface) for browsing and querying SQLite databases directly from your terminal. Built with Python and the powerful [Textual](https://github.com/Textualize/textual) framework, it provides a mouse-aware, keyboard-centric interface that makes database interaction a breeze without ever leaving your console.
 
-*(A screenshot of the main interface showing the object tree, tabs, and a query result)*
+![SQLiteTUI Interface](sqlitetui.png)
 
 ## **Features**
 
