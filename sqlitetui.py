@@ -105,6 +105,10 @@ class SQLiteBrowserApp(App):
     #sql-editor-pane {
         padding: 1;
         height: 15;
+        min-height: 10;
+    }
+    #sql-editor-pane.expanded {
+        height: 30;
     }
     TextArea {
         height: 1fr;
@@ -123,6 +127,8 @@ class SQLiteBrowserApp(App):
         ("q", "quit", "Quit"),
         ("ctrl+r", "reload_objects", "Reload Objects"),
         ("f5", "run_sql", "Execute SQL"),
+        ("ctrl+e", "toggle_editor_size", "Expand/Collapse Editor"),
+        ("enter", "load_from_history", "Load Query from History"),
     ]
 
     def __init__(self, db_path):
@@ -138,6 +144,7 @@ class SQLiteBrowserApp(App):
         self.sql_history = []
         self._connection = None
         self._all_objects = []  # Store all objects for filtering
+        self._editor_expanded = False
 
     @contextmanager
     def get_connection(self):
@@ -323,7 +330,8 @@ class SQLiteBrowserApp(App):
             history_text.append(f"-- {ts} | {success_marker} | {entry['status']}")
             history_text.append(entry['query'] + ";")
             history_text.append("")
-        self.query_one("#history-view", TextArea).text = "\n".join(history_text)
+        history_view = self.query_one("#history-view", TextArea)
+        history_view.text = "\n".join(history_text)
 
     def run_sql_query(self, query_script: str) -> None:
         """Runs a SQL script and updates the UI."""
@@ -468,9 +476,64 @@ class SQLiteBrowserApp(App):
         sql_query = self.query_one("#sql-editor", TextArea).text
         self.run_sql_query(sql_query)
 
+    def action_toggle_editor_size(self) -> None:
+        """Toggle the SQL editor between normal and expanded size."""
+        editor_pane = self.query_one("#sql-editor-pane")
+        self._editor_expanded = not self._editor_expanded
+        if self._editor_expanded:
+            editor_pane.add_class("expanded")
+        else:
+            editor_pane.remove_class("expanded")
+
+    def action_load_from_history(self) -> None:
+        """Load query from history when Enter is pressed (only in history tab)."""
+        # Only work if we're on the history tab
+        tabs = self.query_one(TabbedContent)
+        if tabs.active != "history-tab":
+            return
+        
+        # Check if history view has focus
+        if not self.query_one("#history-view", TextArea).has_focus:
+            return
+        
+        self._load_query_from_history()
+
     @on(Button.Pressed, "#run-sql-button")
     def on_run_sql_button_pressed(self) -> None:
         self.action_run_sql()
+
+    def _load_query_from_history(self) -> None:
+        """Load selected query from history into the SQL editor."""
+        history_view = self.query_one("#history-view", TextArea)
+        
+        # Get the currently selected line
+        cursor_row = history_view.cursor_location[0]
+        lines = history_view.text.split("\n")
+        
+        if cursor_row >= len(lines):
+            return
+        
+        # Find the query associated with this line
+        # Queries are on lines that don't start with "--" and aren't empty
+        query_line = None
+        
+        # If we're on a comment line, get the next line
+        if lines[cursor_row].startswith("--"):
+            if cursor_row + 1 < len(lines) and lines[cursor_row + 1].strip():
+                query_line = lines[cursor_row + 1]
+        elif lines[cursor_row].strip():
+            query_line = lines[cursor_row]
+        
+        # Load the query into the editor if found
+        if query_line:
+            sql_editor = self.query_one("#sql-editor", TextArea)
+            # Remove trailing semicolon for cleaner editing
+            clean_query = query_line.rstrip(";").strip()
+            if clean_query:
+                sql_editor.text = clean_query
+                # Switch to SQL Editor tab
+                tabs = self.query_one(TabbedContent)
+                tabs.active = "sql-tab"
 
 
 if __name__ == "__main__":
