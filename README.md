@@ -35,7 +35,7 @@ pip install textual
 
 To start the application, simply provide the path to your SQLite database file as an argument:
 
-python sqlitetui.py /path/to/your/database.db
+python sqlitetui.py /path/to/your/database.db   (defaults to :memory: if no file given)
 
 ### **Key Bindings**
 
