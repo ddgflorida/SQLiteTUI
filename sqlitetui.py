@@ -114,12 +114,16 @@ class SQLiteBrowserApp(App):
         ("f5", "run_sql", "Execute SQL"),
     ]
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path):
         super().__init__()
-        if not db_path.is_file():
-            raise FileNotFoundError(f"Database file not found at: {db_path}")
         self.db_path = db_path
-        self.title = f"SQLiteTUI - {self.db_path.name}"
+        self.is_memory_db = (db_path == ":memory:")
+        
+        if self.is_memory_db:
+            self.title = "SQLiteTUI - In-Memory Database"
+        else:
+            self.title = f"SQLiteTUI - {Path(db_path).name}"
+        
         self.sql_history = []
 
     def compose(self) -> ComposeResult:
@@ -384,17 +388,19 @@ class SQLiteBrowserApp(App):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python sqlite_browser.py <database_file>")
-        sys.exit(1)
-
-    db_filename = sys.argv[1]
-    db_path = Path(db_filename)
-
-    if not db_path.is_file():
-        print(f"Error: Database file not found at '{db_path}'")
-        sys.exit(1)
+    # Default to in-memory database if no argument provided
+    if len(sys.argv) == 1:
+        print("No database file specified. Using in-memory database (:memory:)")
+        db_path = ":memory:"
+    else:
+        db_filename = sys.argv[1]
+        db_path_obj = Path(db_filename)
+        
+        # If file doesn't exist, inform user we're creating a new database
+        if not db_path_obj.is_file():
+            print(f"Database file '{db_filename}' does not exist. Creating new database...")
+        
+        db_path = str(db_path_obj)
 
     app = SQLiteBrowserApp(db_path=db_path)
     app.run()
-
