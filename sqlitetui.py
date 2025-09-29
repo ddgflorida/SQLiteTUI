@@ -21,6 +21,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
     Input,
+    Label,
 )
 from textual import on
 
@@ -126,6 +127,40 @@ class SQLiteBrowserApp(App):
         border-top: heavy white;
         height: 1fr;
     }
+    #pagination-controls {
+        height: 5;
+        padding: 1;
+        background: $panel;
+        align: center middle;
+        dock: bottom;
+    }
+    #pagination-controls Horizontal {
+        width: auto;
+        height: auto;
+        align: center middle;
+    }
+    #pagination-controls Button {
+        margin: 0 1;
+        background: $boost;
+        color: $text;
+        min-width: 12;
+        height: 3;
+    }
+    #pagination-controls Button:hover {
+        background: $primary;
+    }
+    #pagination-controls Label {
+        margin: 0 1;
+        color: $text;
+    }
+    #page-input {
+        width: 10;
+        margin: 0 1;
+        height: 3;
+    }
+    #data-view {
+        height: 1fr;
+    }
     """
 
     BINDINGS = [
@@ -136,6 +171,8 @@ class SQLiteBrowserApp(App):
         ("enter", "load_from_history", "Load Query from History"),
         ("ctrl+s", "export_results", "Export Results"),
         ("ctrl+d", "clear_history", "Clear History"),
+        ("ctrl+left", "prev_page", "Previous Page"),
+        ("ctrl+right", "next_page", "Next Page"),
     ]
 
     def __init__(self, db_path):
@@ -162,6 +199,15 @@ class SQLiteBrowserApp(App):
         self._editor_expanded = False
         self._last_query_results = []  # Store last query results for export
         self._last_query_columns = []  # Store column names
+        self._last_query_sql = ""  # Store last query SQL for re-execution on export
+        self._query_result_limit = 5000  # Display limit for query results
+        
+        # Pagination state for data view
+        self._current_page = 1
+        self._page_size = 100
+        self._total_rows = 0
+        self._current_object_name = None
+        self._current_object_type = None
 
     @contextmanager
     def get_connection(self):
@@ -204,7 +250,17 @@ class SQLiteBrowserApp(App):
                                 )
                             yield DataTable(id="sql-results-view", zebra_stripes=True)
                     with TabPane("Table Data", id="data-tab"):
-                        yield DataTable(id="data-view", zebra_stripes=True)
+                        with Vertical():
+                            yield DataTable(id="data-view", zebra_stripes=True)
+                            with Horizontal(id="pagination-controls"):
+                                yield Button("⏮ First", id="first-page", variant="default")
+                                yield Button("◀ Prev", id="prev-page", variant="default")
+                                yield Label("Page:", id="page-label")
+                                yield Input(value="1", id="page-input")
+                                yield Label("of 1", id="total-pages-label")
+                                yield Button("Next ▶", id="next-page", variant="default")
+                                yield Button("Last ⏭", id="last-page", variant="default")
+                                yield Label("(100 rows/page)", id="page-size-label")
                     with TabPane("Table DDL", id="ddl-tab"):
                         yield TextArea("", language="sql", id="ddl-view", read_only=True)
                     with TabPane("History / Log", id="history-tab"):
@@ -381,23 +437,38 @@ class SQLiteBrowserApp(App):
                 # Check if it's a SELECT statement
                 if last_statement.strip().upper().startswith("SELECT") or \
                    last_statement.strip().upper().startswith("WITH"):
-                    rows = cur.fetchall()
+                    
+                    # Fetch with limit for display
+                    rows = cur.fetchmany(self._query_result_limit + 1)  # Fetch one extra to detect truncation
+                    was_truncated = len(rows) > self._query_result_limit
+                    
+                    if was_truncated:
+                        rows = rows[:self._query_result_limit]  # Remove the extra row
+                    
                     if not rows:
                         status_message = "[bold yellow]Query returned 0 rows.[/]"
                         self._last_query_results = []
                         self._last_query_columns = []
+                        self._last_query_sql = ""
                     else:
                         columns = list(rows[0].keys())
                         results_table.add_columns(*columns)
                         results_table.add_rows([tuple(row) for row in rows])
-                        status_message = f"[bold yellow]Query returned {len(rows)} rows.[/]"
-                        # Store results for export
-                        self._last_query_results = [tuple(row) for row in rows]
+                        
+                        # Store query info for export (but not the results)
+                        self._last_query_sql = last_statement
                         self._last_query_columns = columns
+                        self._last_query_results = []  # Don't store results in memory
+                        
+                        if was_truncated:
+                            status_message = f"[bold yellow]Query returned {len(rows)}+ rows (display limited to {self._query_result_limit}). Use Ctrl+S to export all results.[/]"
+                        else:
+                            status_message = f"[bold yellow]Query returned {len(rows)} rows.[/]"
                 else:
                     status_message = f"[bold yellow]{cur.rowcount} rows affected.[/]"
                     self._last_query_results = []
                     self._last_query_columns = []
+                    self._last_query_sql = ""
                 
                 con.commit()
                 success = True
@@ -425,27 +496,83 @@ class SQLiteBrowserApp(App):
         object_name = node.data["name"]
         object_type = node.data["type"]
         
+        # Reset pagination when selecting new object
+        self._current_page = 1
+        self._current_object_name = object_name
+        self._current_object_type = object_type
+        
+        self._load_object_data()
+        self._load_object_ddl(object_name, object_type)
+        
         tabs = self.query_one(TabbedContent)
+        tabs.active = "data-tab"
+
+    def _load_object_data(self) -> None:
+        """Load data for the current object with pagination."""
+        if not self._current_object_name:
+            return
+        
+        object_name = self._current_object_name
+        object_type = self._current_object_type
+        
         data_view_table = self.query_one("#data-view", DataTable)
         data_view_table.clear(columns=True)
-        ddl_view = self.query_one("#ddl-view", TextArea)
         status_bar = self.query_one("#sql-status", Static)
 
         try:
             with self.get_connection() as con:
                 cur = con.cursor()
 
-                # Use proper identifier quoting
-                cur.execute(f'SELECT * FROM {quote_identifier(object_name)} LIMIT 1000')
+                # Get total row count
+                cur.execute(f'SELECT COUNT(*) FROM {quote_identifier(object_name)}')
+                self._total_rows = cur.fetchone()[0]
+                
+                # Calculate total pages
+                total_pages = max(1, (self._total_rows + self._page_size - 1) // self._page_size)
+                
+                # Ensure current page is valid
+                if self._current_page > total_pages:
+                    self._current_page = total_pages
+                if self._current_page < 1:
+                    self._current_page = 1
+                
+                # Calculate offset
+                offset = (self._current_page - 1) * self._page_size
+                
+                # Fetch paginated data
+                cur.execute(f'SELECT * FROM {quote_identifier(object_name)} LIMIT ? OFFSET ?', 
+                           (self._page_size, offset))
                 rows = cur.fetchall()
+                
                 if rows:
                     columns = list(rows[0].keys())
                     data_view_table.add_columns(*columns)
                     data_view_table.add_rows([tuple(row) for row in rows])
                 
-                row_count = len(rows)
-                limit_msg = " (limited to 1000)" if row_count == 1000 else ""
-                status_bar.update(f"Viewing {object_type} '{object_name}'. {row_count} rows{limit_msg}.")
+                # Update pagination controls
+                self.query_one("#page-input", Input).value = str(self._current_page)
+                self.query_one("#total-pages-label", Label).update(f"of {total_pages}")
+                
+                # Update status
+                start_row = offset + 1 if self._total_rows > 0 else 0
+                end_row = min(offset + self._page_size, self._total_rows)
+                status_bar.update(
+                    f"Viewing {object_type} '{object_name}'. "
+                    f"Rows {start_row}-{end_row} of {self._total_rows} "
+                    f"(Page {self._current_page}/{total_pages})"
+                )
+
+        except sqlite3.Error as e:
+            status_bar.update(f"[bold red]Error loading object: {e}[/]")
+
+    def _load_object_ddl(self, object_name: str, object_type: str) -> None:
+        """Load DDL for the given object."""
+        ddl_view = self.query_one("#ddl-view", TextArea)
+        status_bar = self.query_one("#sql-status", Static)
+
+        try:
+            with self.get_connection() as con:
+                cur = con.cursor()
 
                 ddl_parts = []
                 cur.execute(
@@ -491,10 +618,9 @@ class SQLiteBrowserApp(App):
                         ddl_parts.extend(triggers)
 
                 ddl_view.text = "\n".join(ddl_parts)
-                tabs.active = "data-tab"
 
         except sqlite3.Error as e:
-            status_bar.update(f"[bold red]Error loading object: {e}[/]")
+            status_bar.update(f"[bold red]Error loading DDL: {e}[/]")
 
     def action_run_sql(self) -> None:
         sql_query = self.query_one("#sql-editor", TextArea).text
@@ -526,20 +652,43 @@ class SQLiteBrowserApp(App):
         """Export the last query results to CSV and JSON."""
         status_bar = self.query_one("#sql-status", Static)
         
-        if not self._last_query_results or not self._last_query_columns:
+        # Check if we have a query to export
+        if not self._last_query_sql and not self._last_query_results:
             status_bar.update("[bold yellow]No query results to export. Run a SELECT query first.[/]")
             self.notify("No query results to export", severity="warning", timeout=3)
             return
         
+        status_bar.update("[bold cyan]Executing query for full export...[/]")
+        self.notify("Executing query to export all results...", severity="information", timeout=2)
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        try:
+            # Re-execute the query to get ALL results for export
+            with self.get_connection() as con:
+                cur = con.cursor()
+                cur.execute(self._last_query_sql)
+                all_rows = cur.fetchall()
+                
+                if not all_rows:
+                    status_bar.update("[bold yellow]Query returned 0 rows.[/]")
+                    self.notify("No rows to export", severity="warning", timeout=3)
+                    return
+                
+                columns = list(all_rows[0].keys())
+                export_data = [tuple(row) for row in all_rows]
+        except sqlite3.Error as e:
+            status_bar.update(f"[bold red]Export failed: {e}[/]")
+            self.notify(f"Export failed: {e}", severity="error", timeout=5)
+            return
         
         # Export to CSV
         csv_filename = f"export_{timestamp}.csv"
         try:
             with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(self._last_query_columns)
-                writer.writerows(self._last_query_results)
+                writer.writerow(columns)
+                writer.writerows(export_data)
             csv_success = True
             csv_error = None
         except Exception as e:
@@ -550,8 +699,8 @@ class SQLiteBrowserApp(App):
         json_filename = f"export_{timestamp}.json"
         try:
             json_data = [
-                dict(zip(self._last_query_columns, row))
-                for row in self._last_query_results
+                dict(zip(columns, row))
+                for row in export_data
             ]
             with open(json_filename, 'w', encoding='utf-8') as jsonfile:
                 json.dump(json_data, jsonfile, indent=2, default=str)
@@ -574,10 +723,10 @@ class SQLiteBrowserApp(App):
             messages.append(f"JSON failed: {json_error}")
         
         if csv_success and json_success:
-            status_msg = f"[bold yellow]Exported {len(self._last_query_results)} rows → {' | '.join(messages)}[/]"
+            status_msg = f"[bold yellow]Exported {len(export_data)} rows → {' | '.join(messages)}[/]"
             status_bar.update(status_msg)
             self.notify(
-                f"✓ Exported {len(self._last_query_results)} rows to {csv_filename} and {json_filename}",
+                f"✓ Exported {len(export_data)} rows to {csv_filename} and {json_filename}",
                 severity="information",
                 timeout=5
             )
@@ -608,6 +757,60 @@ class SQLiteBrowserApp(App):
         status_bar = self.query_one("#sql-status", Static)
         status_bar.update(f"[bold yellow]Cleared {history_count} history entries.[/]")
         self.notify(f"✓ Cleared {history_count} history entries", severity="information", timeout=3)
+
+    def action_prev_page(self) -> None:
+        """Go to the previous page."""
+        if self._current_page > 1:
+            self._current_page -= 1
+            self._load_object_data()
+
+    def action_next_page(self) -> None:
+        """Go to the next page."""
+        total_pages = max(1, (self._total_rows + self._page_size - 1) // self._page_size)
+        if self._current_page < total_pages:
+            self._current_page += 1
+            self._load_object_data()
+
+    @on(Button.Pressed, "#first-page")
+    def on_first_page_pressed(self) -> None:
+        """Go to the first page."""
+        if self._current_page != 1:
+            self._current_page = 1
+            self._load_object_data()
+
+    @on(Button.Pressed, "#prev-page")
+    def on_prev_page_pressed(self) -> None:
+        """Go to the previous page."""
+        self.action_prev_page()
+
+    @on(Button.Pressed, "#next-page")
+    def on_next_page_pressed(self) -> None:
+        """Go to the next page."""
+        self.action_next_page()
+
+    @on(Button.Pressed, "#last-page")
+    def on_last_page_pressed(self) -> None:
+        """Go to the last page."""
+        total_pages = max(1, (self._total_rows + self._page_size - 1) // self._page_size)
+        if self._current_page != total_pages:
+            self._current_page = total_pages
+            self._load_object_data()
+
+    @on(Input.Submitted, "#page-input")
+    def on_page_input_submitted(self, event: Input.Submitted) -> None:
+        """Jump to a specific page when user enters a page number."""
+        try:
+            page_num = int(event.value)
+            total_pages = max(1, (self._total_rows + self._page_size - 1) // self._page_size)
+            if 1 <= page_num <= total_pages:
+                self._current_page = page_num
+                self._load_object_data()
+            else:
+                # Reset to current page if invalid
+                self.query_one("#page-input", Input).value = str(self._current_page)
+        except ValueError:
+            # Reset to current page if not a number
+            self.query_one("#page-input", Input).value = str(self._current_page)
 
     @on(Button.Pressed, "#run-sql-button")
     def on_run_sql_button_pressed(self) -> None:
