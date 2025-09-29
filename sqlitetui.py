@@ -1,10 +1,11 @@
-# SQLiteTUI - Browse SQLite dateabases
+# SQLiteTUI - Browse SQLite databases
 import sys
 import sqlite3
 import re
 import json
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -18,6 +19,7 @@ from textual.widgets import (
     Button,
     TabbedContent,
     TabPane,
+    Input,
 )
 from textual import on
 
@@ -49,10 +51,14 @@ SQLITE_KEYWORDS = {
     "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT"
 }
 
+def quote_identifier(identifier: str) -> str:
+    """Wraps an identifier in double quotes, escaping any internal quotes."""
+    return f'"{identifier.replace(chr(34), chr(34) + chr(34))}"'
+
 def quote_identifier_if_needed(identifier: str) -> str:
     """Wraps an identifier in double quotes if it's a keyword or needs quoting."""
     if identifier.upper() in SQLITE_KEYWORDS or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
-        return f'"{identifier}"'
+        return quote_identifier(identifier)
     return identifier
 
 
@@ -77,9 +83,14 @@ class SQLiteBrowserApp(App):
         width: 40;
         border-right: heavy white;
     }
+    #search-container {
+        height: 3;
+        padding: 0 1;
+    }
     #object-tree {
         background: $panel;
         width: 100%;
+        height: 1fr;
     }
     #right-pane {
         layout: vertical;
@@ -125,12 +136,34 @@ class SQLiteBrowserApp(App):
             self.title = f"SQLiteTUI - {Path(db_path).name}"
         
         self.sql_history = []
+        self._connection = None
+        self._all_objects = []  # Store all objects for filtering
+
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections."""
+        if self.is_memory_db:
+            # For in-memory databases, maintain a persistent connection
+            if self._connection is None:
+                self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
+                self._connection.row_factory = sqlite3.Row
+            yield self._connection
+        else:
+            # For file databases, create new connections each time
+            con = sqlite3.connect(self.db_path, check_same_thread=False)
+            con.row_factory = sqlite3.Row
+            try:
+                yield con
+            finally:
+                con.close()
 
     def compose(self) -> ComposeResult:
         """Compose the layout of the application."""
         yield Header()
         with Horizontal(id="main-container"):
             with Vertical(id="object-list-container"):
+                with Vertical(id="search-container"):
+                    yield Input(placeholder="Search objects...", id="object-search")
                 yield Tree("DATABASE", id="object-tree")
             with Vertical(id="right-pane"):
                 with TabbedContent(initial="sql-tab"):
@@ -161,13 +194,19 @@ class SQLiteBrowserApp(App):
         self.load_history()
         self.load_db_objects()
 
+    def on_unmount(self) -> None:
+        """Clean up resources when app closes."""
+        if self._connection:
+            self._connection.close()
+
     def action_reload_objects(self) -> None:
         """Action to reload the list of database objects."""
         self.load_db_objects()
         self.query_one("#data-view", DataTable).clear(columns=True)
+        self.query_one("#object-search", Input).value = ""
         self.sub_title = "Select an object"
 
-    def load_db_objects(self) -> None:
+    def load_db_objects(self, filter_text: str = "") -> None:
         """Connects to the DB and populates the object tree."""
         tree = self.query_one("#object-tree", Tree)
         tree.clear()
@@ -175,36 +214,62 @@ class SQLiteBrowserApp(App):
         
         tables_node = tree.root.add("TABLES", expand=True)
         views_node = tree.root.add("VIEWS", expand=True)
+        
+        status_bar = self.query_one("#sql-status", Static)
 
         try:
-            con = sqlite3.connect(self.db_path)
-            cur = con.cursor()
-            
-            for object_type, parent_node in [("table", tables_node), ("view", views_node)]:
-                cur.execute(f"""
-                    SELECT name FROM sqlite_master 
-                    WHERE type='{object_type}' AND name NOT LIKE 'sqlite_%'
-                    ORDER BY name
-                """)
-                for row in cur.fetchall():
-                    object_name = row[0]
-                    object_node = parent_node.add(object_name, data={"name": object_name, "type": object_type})
-                    cur.execute(f'PRAGMA table_info("{object_name}")')
-                    for col in cur.fetchall():
-                        name, dtype, notnull, _, pk = col[1:6]
-                        tags = []
-                        if pk and object_type == "table":
-                            tags.append("[bold gold]PK[/]")
-                        if notnull:
-                            tags.append("[bold red]NN[/]")
-                        tag_str = " ".join(tags)
-                        label = f"{name} [i]({dtype})[/i] {tag_str}"
-                        object_node.add_leaf(label)
+            with self.get_connection() as con:
+                cur = con.cursor()
+                
+                # Store all objects if not filtering
+                if not filter_text:
+                    self._all_objects = []
+                
+                for object_type, parent_node in [("table", tables_node), ("view", views_node)]:
+                    # Use parameterized query to prevent SQL injection
+                    cur.execute("""
+                        SELECT name FROM sqlite_master 
+                        WHERE type=? AND name NOT LIKE 'sqlite_%'
+                        ORDER BY name
+                    """, (object_type,))
+                    
+                    for row in cur.fetchall():
+                        object_name = row[0]
+                        
+                        # Apply filter
+                        if filter_text and filter_text.lower() not in object_name.lower():
+                            continue
+                        
+                        if not filter_text:
+                            self._all_objects.append((object_name, object_type))
+                        
+                        object_node = parent_node.add(
+                            object_name, 
+                            data={"name": object_name, "type": object_type}
+                        )
+                        
+                        # Use quote_identifier for PRAGMA
+                        cur.execute(f'PRAGMA table_info({quote_identifier(object_name)})')
+                        for col in cur.fetchall():
+                            name, dtype, notnull, _, pk = col[1:6]
+                            tags = []
+                            if pk and object_type == "table":
+                                tags.append("[bold gold]PK[/]")
+                            if notnull:
+                                tags.append("[bold red]NN[/]")
+                            tag_str = " ".join(tags)
+                            label = f"{name} [i]({dtype})[/i] {tag_str}"
+                            object_node.add_leaf(label)
+                
+                status_bar.update("Objects loaded successfully")
+                
         except sqlite3.Error as e:
-            self.exit(f"Database error on loading objects: {e}")
-        finally:
-            if con:
-                con.close()
+            status_bar.update(f"[bold red]Error loading objects: {e}[/]")
+
+    @on(Input.Changed, "#object-search")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        """Filter objects based on search input."""
+        self.load_db_objects(filter_text=event.value)
 
     def load_history(self):
         """Loads query history from the JSON file."""
@@ -221,7 +286,7 @@ class SQLiteBrowserApp(App):
         with open(HISTORY_FILE, "w") as f:
             json.dump(self.sql_history, f, indent=2)
 
-    def add_to_history(self, sql: str, status: str):
+    def add_to_history(self, sql: str, status: str, success: bool):
         """Adds a new entry to the history, cleaning the data first."""
         # Clean up the query string to remove trailing semicolons and whitespace
         clean_query = sql.strip().rstrip(";")
@@ -229,13 +294,23 @@ class SQLiteBrowserApp(App):
         # Clean up the status message to remove Rich console markup
         plain_status = re.sub(r"\[.*?\]", "", status)
 
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "query": clean_query,
-            "status": plain_status,
-        }
-        self.sql_history.insert(0, entry)
-        self.sql_history = self.sql_history[:MAX_HISTORY_ITEMS]
+        # Check if this is the same as the most recent query
+        if self.sql_history and self.sql_history[0]["query"] == clean_query:
+            # Update the timestamp and status of the most recent entry instead
+            self.sql_history[0]["timestamp"] = datetime.now().isoformat()
+            self.sql_history[0]["status"] = plain_status
+            self.sql_history[0]["success"] = success
+        else:
+            # Add new entry
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "query": clean_query,
+                "status": plain_status,
+                "success": success,
+            }
+            self.sql_history.insert(0, entry)
+            self.sql_history = self.sql_history[:MAX_HISTORY_ITEMS]
+        
         self.save_history()
         self.update_history_view()
 
@@ -244,7 +319,8 @@ class SQLiteBrowserApp(App):
         history_text = []
         for entry in self.sql_history:
             ts = datetime.fromisoformat(entry['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-            history_text.append(f"-- {ts} | {entry['status']}")
+            success_marker = "✓" if entry.get('success', True) else "✗"
+            history_text.append(f"-- {ts} | {success_marker} | {entry['status']}")
             history_text.append(entry['query'] + ";")
             history_text.append("")
         self.query_one("#history-view", TextArea).text = "\n".join(history_text)
@@ -256,53 +332,52 @@ class SQLiteBrowserApp(App):
         results_table.clear(columns=True)
         status_bar = self.query_one("#sql-status", Static)
         status_message = ""
+        success = False
 
-        con = None
         try:
-            con = sqlite3.connect(self.db_path)
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
+            with self.get_connection() as con:
+                cur = con.cursor()
 
-            statements = [s.strip() for s in query_script.split(";") if s.strip()]
-            if not statements:
-                status_message = "[bold yellow]No SQL statement to execute.[/]"
-                status_bar.update(status_message)
-                self.add_to_history(query_script, "No statement")
-                return
+                statements = [s.strip() for s in query_script.split(";") if s.strip()]
+                if not statements:
+                    status_message = "[bold yellow]No SQL statement to execute.[/]"
+                    status_bar.update(status_message)
+                    self.add_to_history(query_script, "No statement", False)
+                    return
 
-            for statement in statements[:-1]:
-                cur.execute(statement)
+                # Execute all statements except the last
+                for statement in statements[:-1]:
+                    cur.execute(statement)
 
-            last_statement = statements[-1]
-            cur.execute(last_statement)
+                # Execute the last statement
+                last_statement = statements[-1]
+                cur.execute(last_statement)
 
-            if last_statement.upper().startswith("SELECT"):
-                rows = cur.fetchall()
-                if not rows:
-                    status_message = "[bold yellow]SELECT returned 0 rows.[/]"
+                # Check if it's a SELECT statement
+                if last_statement.strip().upper().startswith("SELECT") or \
+                   last_statement.strip().upper().startswith("WITH"):
+                    rows = cur.fetchall()
+                    if not rows:
+                        status_message = "[bold yellow]Query returned 0 rows.[/]"
+                    else:
+                        columns = list(rows[0].keys())
+                        results_table.add_columns(*columns)
+                        results_table.add_rows([tuple(row) for row in rows])
+                        status_message = f"[bold green]Query returned {len(rows)} rows.[/]"
                 else:
-                    columns = list(rows[0].keys())
-                    results_table.add_columns(*columns)
-                    results_table.add_rows([tuple(row) for row in rows])
-                    status_message = f"[bold green]SELECT returned {len(rows)} rows.[/]"
-            else:
-                status_message = f"[bold green]{cur.rowcount} rows affected by the last statement.[/]"
-            
-            con.commit()
-            self.load_db_objects() # Refresh schema in case of DDL changes
+                    status_message = f"[bold green]{cur.rowcount} rows affected.[/]"
+                
+                con.commit()
+                success = True
+                self.load_db_objects() # Refresh schema in case of DDL changes
 
         except sqlite3.Error as e:
-            if con:
-                con.rollback()
             status_message = f"[bold red]SQL Error: {e}[/]"
             self.sub_title = "Query Error"
         finally:
-            if con:
-                con.close()
-            
             status_bar.update(status_message)
             self.sub_title = "Query Complete"
-            self.add_to_history(query_script, status_message)
+            self.add_to_history(query_script, status_message, success)
 
     @on(Tree.NodeSelected, "#object-tree")
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
@@ -324,59 +399,70 @@ class SQLiteBrowserApp(App):
         ddl_view = self.query_one("#ddl-view", TextArea)
         status_bar = self.query_one("#sql-status", Static)
 
-        con = None
         try:
-            con = sqlite3.connect(self.db_path)
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
+            with self.get_connection() as con:
+                cur = con.cursor()
 
-            cur.execute(f'SELECT * FROM {quote_identifier_if_needed(object_name)} LIMIT 1000')
-            rows = cur.fetchall()
-            if rows:
-                columns = list(rows[0].keys())
-                data_view_table.add_columns(*columns)
-                data_view_table.add_rows([tuple(row) for row in rows])
-            status_bar.update(f"Viewing {object_type} '{object_name}'. {len(rows)} rows.")
+                # Use proper identifier quoting
+                cur.execute(f'SELECT * FROM {quote_identifier(object_name)} LIMIT 1000')
+                rows = cur.fetchall()
+                if rows:
+                    columns = list(rows[0].keys())
+                    data_view_table.add_columns(*columns)
+                    data_view_table.add_rows([tuple(row) for row in rows])
+                
+                row_count = len(rows)
+                limit_msg = " (limited to 1000)" if row_count == 1000 else ""
+                status_bar.update(f"Viewing {object_type} '{object_name}'. {row_count} rows{limit_msg}.")
 
-            ddl_parts = []
-            cur.execute("SELECT sql FROM sqlite_master WHERE type=? AND name=?", (object_type, object_name))
-            result = cur.fetchone()
-            if result: ddl_parts.append(result[0] + ";")
+                ddl_parts = []
+                cur.execute(
+                    "SELECT sql FROM sqlite_master WHERE type=? AND name=?", 
+                    (object_type, object_name)
+                )
+                result = cur.fetchone()
+                if result: 
+                    ddl_parts.append(result[0] + ";")
 
-            if object_type == "table":
-                # Logic for table-specific DDL like indexes and triggers
-                cur.execute(f'PRAGMA index_list("{object_name}")')
-                pk_index_name = next((idx[1] for idx in cur.fetchall() if idx[3] == 'pk'), None)
+                if object_type == "table":
+                    # Get indexes
+                    cur.execute(f'PRAGMA index_list({quote_identifier(object_name)})')
+                    indexes_info = cur.fetchall()
+                    pk_index_name = next((idx[1] for idx in indexes_info if idx[3] == 'pk'), None)
 
-                if pk_index_name:
-                    cur.execute(f'PRAGMA index_info("{pk_index_name}")')
-                    cols = [row[2] for row in cur.fetchall()]
-                    if cols:
-                        q_idx = quote_identifier_if_needed(pk_index_name)
-                        q_tbl = quote_identifier_if_needed(object_name)
-                        col_str = ", ".join(quote_identifier_if_needed(c) for c in cols)
-                        ddl_parts.append(f'\n-- Primary Key Index\nCREATE UNIQUE INDEX {q_idx} ON {q_tbl}({col_str});')
+                    if pk_index_name:
+                        cur.execute(f'PRAGMA index_info({quote_identifier(pk_index_name)})')
+                        cols = [row[2] for row in cur.fetchall()]
+                        if cols:
+                            q_idx = quote_identifier(pk_index_name)
+                            q_tbl = quote_identifier(object_name)
+                            col_str = ", ".join(quote_identifier(c) for c in cols)
+                            ddl_parts.append(f'\n-- Primary Key Index\nCREATE UNIQUE INDEX {q_idx} ON {q_tbl}({col_str});')
 
-                cur.execute("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (object_name,))
-                indexes = [idx[0] + ";" for idx in cur.fetchall() if pk_index_name is None or pk_index_name not in idx[0]]
-                if indexes:
-                    ddl_parts.append("\n-- Other Indexes")
-                    ddl_parts.extend(indexes)
+                    cur.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", 
+                        (object_name,)
+                    )
+                    indexes = [idx[0] + ";" for idx in cur.fetchall() 
+                              if pk_index_name is None or pk_index_name not in idx[0]]
+                    if indexes:
+                        ddl_parts.append("\n-- Other Indexes")
+                        ddl_parts.extend(indexes)
 
-                cur.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (object_name,))
-                triggers = [trg[0] + ";" for trg in cur.fetchall() if trg[0]]
-                if triggers:
-                    ddl_parts.append("\n-- Triggers")
-                    ddl_parts.extend(triggers)
+                    cur.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?", 
+                        (object_name,)
+                    )
+                    triggers = [trg[0] + ";" for trg in cur.fetchall() if trg[0]]
+                    if triggers:
+                        ddl_parts.append("\n-- Triggers")
+                        ddl_parts.extend(triggers)
 
-            ddl_view.text = "\n".join(ddl_parts)
-            tabs.active = "data-tab"
+                ddl_view.text = "\n".join(ddl_parts)
+                tabs.active = "data-tab"
 
         except sqlite3.Error as e:
             status_bar.update(f"[bold red]Error loading object: {e}[/]")
-        finally:
-            if con:
-                con.close()
 
     def action_run_sql(self) -> None:
         sql_query = self.query_one("#sql-editor", TextArea).text
