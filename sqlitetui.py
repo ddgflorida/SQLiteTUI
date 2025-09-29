@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import re
 import json
+import csv
 from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
@@ -24,8 +25,11 @@ from textual.widgets import (
 from textual import on
 
 # --- History Configuration ---
-HISTORY_FILE = Path.home() / ".sqlite_browser_history.json"
+HISTORY_DIR = Path.home() / ".sqlite_browser_history"
 MAX_HISTORY_ITEMS = 100
+
+# Ensure history directory exists
+HISTORY_DIR.mkdir(exist_ok=True)
 
 # --- Helper function for SQL identifier quoting ---
 
@@ -98,9 +102,10 @@ class SQLiteBrowserApp(App):
     }
     #sql-status {
         padding: 0 1;
-        height: 1;
+        height: 2;
         background: $primary;
         color: $text;
+        dock: top;
     }
     #sql-editor-pane {
         padding: 1;
@@ -129,6 +134,8 @@ class SQLiteBrowserApp(App):
         ("f5", "run_sql", "Execute SQL"),
         ("ctrl+e", "toggle_editor_size", "Expand/Collapse Editor"),
         ("enter", "load_from_history", "Load Query from History"),
+        ("ctrl+s", "export_results", "Export Results"),
+        ("ctrl+d", "clear_history", "Clear History"),
     ]
 
     def __init__(self, db_path):
@@ -138,13 +145,23 @@ class SQLiteBrowserApp(App):
         
         if self.is_memory_db:
             self.title = "SQLiteTUI - In-Memory Database"
+            # Use a generic history file for in-memory databases
+            self.history_file = HISTORY_DIR / "memory_db_history.json"
         else:
             self.title = f"SQLiteTUI - {Path(db_path).name}"
+            # Use full resolved path for database-specific history file
+            full_path = Path(db_path).resolve()
+            # Replace path separators with underscores and sanitize
+            safe_path = str(full_path).replace('/', '_').replace('\\', '_').replace(':', '_')
+            safe_path = re.sub(r'[^\w\-._]', '_', safe_path)
+            self.history_file = HISTORY_DIR / f"{safe_path}_history.json"
         
         self.sql_history = []
         self._connection = None
         self._all_objects = []  # Store all objects for filtering
         self._editor_expanded = False
+        self._last_query_results = []  # Store last query results for export
+        self._last_query_columns = []  # Store column names
 
     @contextmanager
     def get_connection(self):
@@ -280,8 +297,8 @@ class SQLiteBrowserApp(App):
 
     def load_history(self):
         """Loads query history from the JSON file."""
-        if HISTORY_FILE.exists():
-            with open(HISTORY_FILE, "r") as f:
+        if self.history_file.exists():
+            with open(self.history_file, "r") as f:
                 try:
                     self.sql_history = json.load(f)
                 except json.JSONDecodeError:
@@ -290,7 +307,7 @@ class SQLiteBrowserApp(App):
 
     def save_history(self):
         """Saves query history to the JSON file."""
-        with open(HISTORY_FILE, "w") as f:
+        with open(self.history_file, "w") as f:
             json.dump(self.sql_history, f, indent=2)
 
     def add_to_history(self, sql: str, status: str, success: bool):
@@ -367,13 +384,20 @@ class SQLiteBrowserApp(App):
                     rows = cur.fetchall()
                     if not rows:
                         status_message = "[bold yellow]Query returned 0 rows.[/]"
+                        self._last_query_results = []
+                        self._last_query_columns = []
                     else:
                         columns = list(rows[0].keys())
                         results_table.add_columns(*columns)
                         results_table.add_rows([tuple(row) for row in rows])
-                        status_message = f"[bold green]Query returned {len(rows)} rows.[/]"
+                        status_message = f"[bold yellow]Query returned {len(rows)} rows.[/]"
+                        # Store results for export
+                        self._last_query_results = [tuple(row) for row in rows]
+                        self._last_query_columns = columns
                 else:
-                    status_message = f"[bold green]{cur.rowcount} rows affected.[/]"
+                    status_message = f"[bold yellow]{cur.rowcount} rows affected.[/]"
+                    self._last_query_results = []
+                    self._last_query_columns = []
                 
                 con.commit()
                 success = True
@@ -497,6 +521,93 @@ class SQLiteBrowserApp(App):
             return
         
         self._load_query_from_history()
+
+    def action_export_results(self) -> None:
+        """Export the last query results to CSV and JSON."""
+        status_bar = self.query_one("#sql-status", Static)
+        
+        if not self._last_query_results or not self._last_query_columns:
+            status_bar.update("[bold yellow]No query results to export. Run a SELECT query first.[/]")
+            self.notify("No query results to export", severity="warning", timeout=3)
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Export to CSV
+        csv_filename = f"export_{timestamp}.csv"
+        try:
+            with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(self._last_query_columns)
+                writer.writerows(self._last_query_results)
+            csv_success = True
+            csv_error = None
+        except Exception as e:
+            csv_success = False
+            csv_error = str(e)
+        
+        # Export to JSON
+        json_filename = f"export_{timestamp}.json"
+        try:
+            json_data = [
+                dict(zip(self._last_query_columns, row))
+                for row in self._last_query_results
+            ]
+            with open(json_filename, 'w', encoding='utf-8') as jsonfile:
+                json.dump(json_data, jsonfile, indent=2, default=str)
+            json_success = True
+            json_error = None
+        except Exception as e:
+            json_success = False
+            json_error = str(e)
+        
+        # Update status and show notification
+        messages = []
+        if csv_success:
+            messages.append(f"CSV: {csv_filename}")
+        else:
+            messages.append(f"CSV failed: {csv_error}")
+        
+        if json_success:
+            messages.append(f"JSON: {json_filename}")
+        else:
+            messages.append(f"JSON failed: {json_error}")
+        
+        if csv_success and json_success:
+            status_msg = f"[bold yellow]Exported {len(self._last_query_results)} rows → {' | '.join(messages)}[/]"
+            status_bar.update(status_msg)
+            self.notify(
+                f"✓ Exported {len(self._last_query_results)} rows to {csv_filename} and {json_filename}",
+                severity="information",
+                timeout=5
+            )
+        elif csv_success or json_success:
+            status_msg = f"[bold magenta]Partial export: {' | '.join(messages)}[/]"
+            status_bar.update(status_msg)
+            self.notify(f"⚠ Partial export: {' | '.join(messages)}", severity="warning", timeout=5)
+        else:
+            status_msg = f"[bold red]Export failed: {' | '.join(messages)}[/]"
+            status_bar.update(status_msg)
+            self.notify(f"✗ Export failed", severity="error", timeout=5)
+
+    def action_clear_history(self) -> None:
+        """Clear the query history for this database."""
+        if not self.sql_history:
+            status_bar = self.query_one("#sql-status", Static)
+            status_bar.update("[bold yellow]History is already empty.[/]")
+            self.notify("History is already empty", severity="information", timeout=3)
+            return
+        
+        # Clear the history
+        history_count = len(self.sql_history)
+        self.sql_history = []
+        self.save_history()
+        self.update_history_view()
+        
+        # Update status and notify
+        status_bar = self.query_one("#sql-status", Static)
+        status_bar.update(f"[bold yellow]Cleared {history_count} history entries.[/]")
+        self.notify(f"✓ Cleared {history_count} history entries", severity="information", timeout=3)
 
     @on(Button.Pressed, "#run-sql-button")
     def on_run_sql_button_pressed(self) -> None:
